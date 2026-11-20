@@ -881,6 +881,29 @@ impl OhosTextSystemState {
                 }
             }
         }
+        // Symbol and emoji faces are not part of a UI font's declared stack,
+        // but they are the only glyphs for pictographs such as `☀` (U+2600)
+        // and for emoji clusters. Append them last, so a cluster only reaches
+        // them when nothing the caller asked for covers it; which of the two
+        // wins is decided per cluster from the variation selector and the
+        // character's Unicode default presentation (TASK-1.7.5).
+        for name in [
+            "Noto Sans Symbols 2",
+            "Noto Sans Symbols",
+            "HMOS Color Emoji",
+            "Noto Color Emoji",
+        ] {
+            if let Some(id) = self.load_family(name, requested)? {
+                if ids
+                    .iter()
+                    .any(|previous| self.loaded_font(*previous).font.id() == self.loaded_font(id).font.id())
+                {
+                    self.loaded_fonts.pop();
+                } else {
+                    ids.push(id);
+                }
+            }
+        }
         if ids.is_empty() {
             let first = self
                 .font_system
@@ -1053,6 +1076,13 @@ impl OhosTextSystemState {
             .glyph_image(key, style, params.font_id)
             .map(|image| image.placement)
             .with_context(|| format!("no image for {params:?}"))?;
+        if placement.width == 0 || placement.height == 0 {
+            // A glyph with no ink — a variation selector, or a character whose
+            // outline is empty — must paint nothing. gpui aborts the whole line
+            // on the first error from `raster_bounds`, so reporting "no image"
+            // here silently dropped every glyph that followed it (TASK-1.7.5).
+            return Ok(Bounds::default());
+        }
         Ok(Bounds {
             origin: point(placement.left.into(), (-placement.top).into()),
             size: size(placement.width.into(), placement.height.into()),
@@ -1109,10 +1139,34 @@ impl OhosTextSystemState {
     }
 
     fn font_for_cluster(&self, primary: FontId, cluster: &str) -> FontId {
-        std::iter::once(primary)
+        // UTS #51: the variation selector (or, without one, the codepoint's
+        // default presentation) decides whether the emoji glyph or the text
+        // glyph is wanted. Picking the first font that merely maps the
+        // codepoint is what made `☀` (text default) render as a color emoji
+        // and made VS15/VS16 indistinguishable (TASK-1.7.5).
+        let presentation = cluster_presentation(cluster);
+        let mut any_covering = None;
+        for id in std::iter::once(primary)
             .chain(self.loaded_font(primary).fallbacks.iter().copied())
-            .find(|id| font_covers(&self.loaded_font(*id).font, cluster))
-            .unwrap_or(primary)
+        {
+            let loaded = self.loaded_font(id);
+            if !font_covers(&loaded.font, cluster) {
+                continue;
+            }
+            let wanted = match presentation {
+                ClusterPresentation::Emoji => loaded.has_color_glyphs,
+                ClusterPresentation::Text => !loaded.has_color_glyphs,
+            };
+            if wanted {
+                return id;
+            }
+            any_covering.get_or_insert(id);
+        }
+        // No font of the wanted presentation maps the cluster: a color emoji
+        // font cannot draw a text-presentation glyph (no installed HarmonyOS
+        // font has a monochrome 🙂), so fall back to what exists rather than
+        // dropping the character.
+        any_covering.unwrap_or(primary)
     }
 
     fn glyph_is_emoji(&mut self, id: FontId, glyph: u16, font_size: Pixels) -> bool {
@@ -1209,6 +1263,7 @@ impl OhosTextSystemState {
             .expect("layout should contain one line");
 
         let mut runs: Vec<ShapedRun> = Vec::new();
+        let mut previous_cluster: Option<(usize, usize)> = None;
         for glyph in &layout.glyphs {
             let mut font_id = FontId(glyph.metadata);
             let loaded_font = self.loaded_font(font_id);
@@ -1216,6 +1271,28 @@ impl OhosTextSystemState {
                 || loaded_font.font_weight != glyph.font_weight
             {
                 font_id = self.font_id_for_cosmic_id(glyph.font_id, glyph.font_weight, font_id);
+            }
+            // A variation selector has no ink of its own, and a character no
+            // font maps must stay blank: the swash notdef box is a visible
+            // "empty square" that misrepresents the text, so skip both instead
+            // of painting them (TASK-1.7.5).
+            let cluster = text
+                .get(glyph.start..)
+                .and_then(|rest| rest.graphemes(true).next())
+                .unwrap_or_default();
+            // cosmic-text emits the base glyph and a second glyph for the
+            // variation selector; both carry the cluster's byte range. Keep the
+            // first one only — the selector glyph has no ink of its own.
+            let starts_cluster = previous_cluster != Some((glyph.start, glyph.end));
+            previous_cluster = Some((glyph.start, glyph.end));
+            if cluster.chars().all(is_variation_selector) {
+                continue;
+            }
+            if !starts_cluster && cluster.chars().any(is_variation_selector) {
+                continue;
+            }
+            if glyph.glyph_id == 0 && !font_covers(&self.loaded_font(font_id).font, cluster) {
+                continue;
             }
             // GPUI's `is_emoji` selects the RGBA atlas. Font names are not a
             // reliable format test (HarmonyOS uses other color emoji fonts).
@@ -1255,6 +1332,82 @@ impl OhosTextSystemState {
             len: text.len(),
         }
     }
+}
+
+fn is_variation_selector(ch: char) -> bool {
+    matches!(ch as u32, 0xfe00..=0xfe0f | 0xe0100..=0xe01ef)
+}
+
+/// Whether the emoji or the text glyph is wanted for a shaped cluster.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClusterPresentation {
+    /// U+FE0F, or an emoji-default codepoint without a variation selector.
+    Emoji,
+    /// U+FE0E, or a text-default codepoint without a variation selector.
+    Text,
+}
+
+fn cluster_presentation(cluster: &str) -> ClusterPresentation {
+    let mut explicit = None;
+    for ch in cluster.chars() {
+        match ch {
+            '\u{fe0f}' => explicit = Some(ClusterPresentation::Emoji),
+            '\u{fe0e}' => explicit = Some(ClusterPresentation::Text),
+            _ => {}
+        }
+    }
+    explicit.unwrap_or_else(|| {
+        if cluster.chars().next().is_some_and(default_emoji_presentation) {
+            ClusterPresentation::Emoji
+        } else {
+            ClusterPresentation::Text
+        }
+    })
+}
+
+/// `Emoji_Presentation=Yes` from the UTS #51 emoji data: the BMP entries plus
+/// the emoji planes, where every assigned codepoint defaults to emoji
+/// presentation. The handful of text-default codepoints above the BMP have no
+/// monochrome face installed on HarmonyOS, so the approximation is not
+/// observable there.
+fn default_emoji_presentation(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x231a..=0x231b
+            | 0x23e9..=0x23ec
+            | 0x23f0
+            | 0x23f3
+            | 0x25fd..=0x25fe
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267f
+            | 0x2693
+            | 0x26a1
+            | 0x26aa..=0x26ab
+            | 0x26bd..=0x26be
+            | 0x26c4..=0x26c5
+            | 0x26ce
+            | 0x26d4
+            | 0x26ea
+            | 0x26f2..=0x26f3
+            | 0x26f5
+            | 0x26fa
+            | 0x26fd
+            | 0x2705
+            | 0x270a..=0x270b
+            | 0x2728
+            | 0x274c
+            | 0x274e
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27b0
+            | 0x27bf
+            | 0x2b1b..=0x2b1c
+            | 0x2b50
+            | 0x2b55
+            | 0x1f000..=0x1faff
+    )
 }
 
 fn font_covers(font: &CosmicTextFont, cluster: &str) -> bool {
