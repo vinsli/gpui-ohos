@@ -177,10 +177,19 @@ impl WgpuAtlasState {
         };
 
         let size = min_size.max(&DEFAULT_ATLAS_SIZE);
+        // `Bgra8Unorm` atlases never receive their pixels on the Maleoon 916 GLES
+        // driver: `queue.write_texture` into a BGRA texture is silently dropped (the
+        // texture reads back as all zeroes, with no wgpu validation error), so
+        // every `textureSample` in the sprite shaders returns 0 and images/emoji
+        // paint nothing at all.
+        //
+        // The uploaded bytes stay BGRA-ordered (that is what `RenderImage` hands
+        // over, and what `text_system::rasterize_glyph` swizzles emoji glyphs to),
+        // so `Rgba8Unorm` storage is un-swizzled on read in `fs_poly_sprite`.
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
-            AtlasTextureKind::Subpixel => wgpu::TextureFormat::Bgra8Unorm,
-            AtlasTextureKind::Polychrome => wgpu::TextureFormat::Bgra8Unorm,
+            AtlasTextureKind::Subpixel => wgpu::TextureFormat::Rgba8Unorm,
+            AtlasTextureKind::Polychrome => wgpu::TextureFormat::Rgba8Unorm,
         };
 
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {

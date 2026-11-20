@@ -1555,7 +1555,10 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 
     let distance = quad_sdf(input.position.xy, bounds, corner_radii);
 
-    var color = sample;
+    // The atlas bytes are BGRA-ordered (see `wgpu_atlas.rs`), but the atlas
+    // texture must be `Rgba8Unorm` because this driver drops BGRA uploads, so the
+    // channels arrive swapped here and are un-swizzled back to RGB.
+    var color = sample.bgra;
     if ((input.grayscale & 0xFFu) != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
