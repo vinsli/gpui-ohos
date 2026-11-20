@@ -11,6 +11,7 @@ mod file_access;
 mod frame_delivery;
 mod frame_demand;
 mod image_alpha;
+mod ime_policy;
 mod keyboard;
 mod launch;
 mod mouse_buttons;
@@ -45,6 +46,8 @@ mod workers;
 use openharmony_ability::OpenHarmonyApp;
 
 pub use platform_options::PlatformOptions;
+
+pub use ime_policy::{ImeMode, ime_mode, set_ime_mode};
 
 pub fn try_current_platform(
     app: OpenHarmonyApp,

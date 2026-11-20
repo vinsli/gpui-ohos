@@ -130,6 +130,13 @@ pub(crate) struct OhosWindow {
     keyboard_overlap_device_px: Cell<i32>,
     input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     ime_text_update_pending: Rc<Cell<bool>>,
+    ime_caret_update_pending: Rc<Cell<bool>>,
+    /// Last caret rectangle pulled from the input handler. `set_input_handler`
+    /// runs on every frame and `try_update_cursor` is an IPC round trip, so an
+    /// unchanged rectangle must not be re-sent.
+    ime_caret_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Mode this window last applied, so a process-wide switch is noticed once.
+    ime_mode: Cell<super::ime_policy::ImeMode>,
     edit_generation: Rc<Cell<u64>>,
     clipboard: super::clipboard::OhosClipboard,
     file_access: Arc<super::file_access::FileAccess>,
@@ -742,6 +749,9 @@ impl OhosWindow {
             keyboard_overlap_device_px: Cell::new(0),
             input_handler: Rc::new(RefCell::new(None)),
             ime_text_update_pending: Rc::new(Cell::new(false)),
+            ime_caret_update_pending: Rc::new(Cell::new(false)),
+            ime_caret_bounds: Rc::new(Cell::new(None)),
+            ime_mode: Cell::new(super::ime_policy::ime_mode()),
             edit_generation: Rc::new(Cell::new(0)),
             clipboard,
             file_access,
@@ -1416,6 +1426,13 @@ impl OhosWindow {
             return;
         }
         self.ime_retry_pending.set(false);
+        if super::ime_policy::ime_mode() == super::ime_policy::ImeMode::Detached {
+            // No editor bound: hardware keys reach the application directly.
+            // Anything already attached must go, or the IME keeps the keys the
+            // application is waiting for.
+            self.detach_ime();
+            return;
+        }
         if show_keyboard {
             self.apply_ime_action(false);
         }
@@ -1424,6 +1441,10 @@ impl OhosWindow {
         };
         #[cfg(feature = "api-26")]
         if super::device::sdk_api_version() >= 26 {
+            // Kept as upstream: the flag does not change which keys the editor
+            // takes (measured), it only decides whether the post-IME key event
+            // is delivered at all. Raw hardware keys come from
+            // `ImeMode::Detached`, not from here.
             if let Err(error) = app.with_ime_for(self.window_id, |ime| {
                 ime.set_consume_key_events(true);
             }) {
@@ -1470,6 +1491,8 @@ impl OhosWindow {
                 }
                 self.apply_ime_action(true);
                 self.schedule_ime_text_update();
+                // A fresh attachment starts with no caret: push the current one.
+                self.schedule_ime_caret_update();
             }
             Err(error) => {
                 if show_keyboard {
@@ -2949,6 +2972,80 @@ impl OhosWindow {
             .detach();
     }
 
+    /// Track the process-wide IME mode on the frame where it changes.
+    ///
+    /// The mode lives outside the window because HarmonyOS routes keys to one
+    /// IME editor for the whole process, but the release has to happen here:
+    /// `detach_ime` is what actually hands the keyboard back to the application.
+    /// Checked once per paint (an atomic load), acted on only when it differs.
+    fn sync_ime_mode(&self) {
+        use super::ime_policy::ImeMode;
+        let mode = super::ime_policy::ime_mode();
+        if self.ime_mode.get() == mode {
+            return;
+        }
+        self.ime_mode.set(mode);
+        match mode {
+            ImeMode::Detached => {
+                self.detach_ime();
+                self.hide_keyboard_if_needed();
+            }
+            ImeMode::Attached => self.show_keyboard_if_needed(),
+        }
+    }
+
+    /// Publish the caret rectangle the input method anchors candidates to.
+    ///
+    /// GPUI only pushes it from `Window::invalidate_character_coordinates`, which
+    /// nothing in this backend calls, so the IME never learnt where the caret is
+    /// and fell back to its own placement (screen centre). Pull the rectangle the
+    /// application already computes for `bounds_for_range` instead.
+    ///
+    /// `set_input_handler` runs on every paint, so the rectangle is cached by
+    /// value: `try_update_cursor` is an IPC round trip.
+    fn schedule_ime_caret_update(&self) {
+        let Some(app) = self.app.borrow().clone() else {
+            return;
+        };
+        if self.ime_caret_update_pending.replace(true) {
+            return;
+        }
+        let pending = self.ime_caret_update_pending.clone();
+        let input_handler = self.input_handler.clone();
+        let last_bounds = self.ime_caret_bounds.clone();
+        let window_id = self.window_id;
+        let window = self
+            .window_index
+            .upgrade()
+            .and_then(|index| index.borrow().get(&window_id).cloned());
+        self.foreground_executor
+            .spawn(async move {
+                pending.set(false);
+                if !app.is_text_input_ready_for(window_id) {
+                    return;
+                }
+                let bounds = {
+                    let Ok(mut guard) = input_handler.try_borrow_mut() else {
+                        return;
+                    };
+                    let candidate = guard
+                        .as_mut()
+                        .and_then(|handler| handler.ime_candidate_bounds());
+                    // Drop the cache when there is nothing to anchor to, so the
+                    // same rectangle is pushed again after a re-attachment.
+                    last_bounds.set(candidate);
+                    candidate
+                };
+                let Some(bounds) = bounds else {
+                    return;
+                };
+                if let Some(window) = window.and_then(|window| window.upgrade()) {
+                    window.borrow().update_ime_position(bounds);
+                }
+            })
+            .detach();
+    }
+
     pub(crate) fn handle_input_event(&self, event: &InputEvent) {
         if self.closed.get() || self.released.get() {
             return;
@@ -3390,12 +3487,17 @@ impl OhosWindow {
             ImeEvent::TextInputEvent(data) => {
                 handler.replace_text_in_range(None, &data.text);
                 handler.unmark_text();
+                self.schedule_ime_caret_update();
             }
             ImeEvent::PreviewTextEvent { text, start, end } => {
                 let range = (start >= 0 && end >= start).then_some(start as usize..end as usize);
                 handler.replace_and_mark_text_in_range(range, &text, None);
+                self.schedule_ime_caret_update();
             }
-            ImeEvent::FinishPreviewEvent => handler.unmark_text(),
+            ImeEvent::FinishPreviewEvent => {
+                handler.unmark_text();
+                self.schedule_ime_caret_update();
+            }
             ImeEvent::EnterEvent(_) => unreachable!("confirm key handled above"),
             ImeEvent::MoveCursorEvent(_) => {
                 unreachable!("cursor key handled above")
@@ -3638,11 +3740,19 @@ impl OhosWindow {
             } else if let Some(character) = character {
                 // ArkUI sends this callback only after the IME declines the key.
                 // Numeric-keypad/space input still needs a text insertion path.
-                if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
-                    if handler.query_accepts_text_input() {
-                        handler.unmark_text();
-                        handler.replace_text_in_range(None, &character);
-                        consumed = true;
+                //
+                // With the IME detached there is nothing to insert *for*: the
+                // keystroke already reached the application as `KeyDown`, and an
+                // application that inserts characters itself (a terminal) would
+                // add every printable key twice. Insertion from a keystroke is a
+                // compensation for a bound IME that owned the text path.
+                if super::ime_policy::ime_mode() == super::ime_policy::ImeMode::Attached {
+                    if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
+                        if handler.query_accepts_text_input() {
+                            handler.unmark_text();
+                            handler.replace_text_in_range(None, &character);
+                            consumed = true;
+                        }
                     }
                 }
                 self.schedule_ime_text_update();
@@ -3935,7 +4045,15 @@ impl PlatformWindow for OhosWindowHandle {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         *self.input_handler.borrow_mut() = Some(input_handler);
-        self.with_window(|window| window.schedule_ime_text_update());
+        self.with_window(|window| {
+            // A mode switch must be able to release the keyboard without waiting
+            // for the next focus change.
+            window.sync_ime_mode();
+            window.schedule_ime_text_update();
+            // Every paint re-registers the handler, so the caret is refreshed
+            // here; `schedule_ime_caret_update` collapses unchanged rectangles.
+            window.schedule_ime_caret_update();
+        });
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {

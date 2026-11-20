@@ -474,6 +474,8 @@ impl OhosPlatform {
         );
 
         let app_slot = Rc::new(RefCell::new(None));
+        // The key policy is process-wide: HarmonyOS owns a single IME editor.
+        super::ime_policy::set_ime_mode(options.ime_mode);
         let form_factor = super::device::DeviceFormFactor::detect();
         let clipboard = super::clipboard::OhosClipboard::new(
             app_slot.clone(),
