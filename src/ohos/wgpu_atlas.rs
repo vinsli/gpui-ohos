@@ -121,22 +121,55 @@ impl PlatformAtlas for WgpuAtlas {
     }
 
     fn remove(&self, key: &AtlasKey) {
-        let mut lock = self.0.lock();
+        self.0.lock().remove_tile(key);
+    }
 
-        let Some(tile) = lock.tiles_by_key.remove(key) else {
+    // HERDR: a reloaded SVG drops its cached sizes through this method; the
+    // desktop atlases got it with gpui-pre 0.3.11 and this one shipped
+    // without it. See vendor/gpui-ohos/VENDORED.md.
+    fn remove_svg(&self, path: &str) {
+        self.0.lock().remove_svg(path);
+    }
+}
+
+impl WgpuAtlasState {
+    fn remove_tile(&mut self, key: &AtlasKey) {
+        let Some(tile) = self.tiles_by_key.remove(key) else {
             return;
         };
-        lock.image_flags.remove(&(tile.texture_id, tile.tile_id.0));
+        self.release_tile(tile);
+    }
+
+    /// Remove SVGs at or beneath this path, releasing all their atlas tiles.
+    fn remove_svg(&mut self, path: &str) {
+        let mut released = Vec::new();
+        self.tiles_by_key.retain(|key, tile| {
+            if matches!(key, AtlasKey::Svg(params)
+                if std::path::Path::new(params.path.as_ref()).starts_with(path))
+            {
+                released.push(*tile);
+                false
+            } else {
+                true
+            }
+        });
+        for tile in released {
+            self.release_tile(tile);
+        }
+    }
+
+    fn release_tile(&mut self, tile: AtlasTile) {
+        self.image_flags.remove(&(tile.texture_id, tile.tile_id.0));
         let id = tile.texture_id;
 
-        let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
+        let Some(texture_slot) = self.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
 
         if let Some(mut texture) = texture_slot.take() {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
-                lock.storage[id.kind]
+                self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
             } else {
