@@ -888,6 +888,10 @@ impl OhosTextSystemState {
         // wins is decided per cluster from the variation selector and the
         // character's Unicode default presentation (TASK-1.7.5).
         for name in [
+            // A bundled monochrome emoji face (e.g. `Noto Emoji` from
+            // probe/fonts) is the only way a VS15 request can be honoured:
+            // HarmonyOS ships color emoji faces exclusively.
+            "Noto Emoji",
             "Noto Sans Symbols 2",
             "Noto Sans Symbols",
             "HMOS Color Emoji",
