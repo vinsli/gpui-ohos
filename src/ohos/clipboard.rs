@@ -123,8 +123,42 @@ impl OhosClipboard {
             }
         }
         *self.cache.borrow_mut() = None;
-        self.schedule_refresh();
-        None
+        // A cache this stale is only ever reached by a paste gesture, and a
+        // gesture is the one moment HarmonyOS lets the app read the board: the
+        // system grants the read for a keystroke (its Ctrl+V trust window) and
+        // for nothing else. That grant belongs to this call, so the read has to
+        // happen here, synchronously; a task scheduled from here runs after the
+        // window closed and is refused with 201. Only a failed read falls back
+        // to the background refresh, which keeps the cache warm for the next
+        // paste.
+        match self.read_now() {
+            Ok(item) => {
+                *self.cache.borrow_mut() = revision.map(|revision| (revision, item.clone()));
+                item
+            }
+            Err(error) => {
+                log::warn!("Failed to read OHOS clipboard now: {error}");
+                self.schedule_refresh();
+                None
+            }
+        }
+    }
+
+    /// Reads the board on this thread, through the same native facade as
+    /// [`Self::read`]: `read_records` polls straight into the platform IPC, so
+    /// the future completes on its first poll. It fails without the read grant,
+    /// which is why only a paste gesture calls this.
+    fn read_now(&self) -> std::result::Result<Option<ClipboardItem>, ClipboardError> {
+        let Some(app) = self.app.borrow().clone() else {
+            return Err(ClipboardError::Native("no OpenHarmony app".into()));
+        };
+        let client = ClipboardClient::new(&app)
+            .and_then(|client| client.with_metadata_mime_type(METADATA_MIME))?;
+        let records = futures::executor::block_on(client.read_records())?;
+        Ok(item_from_records(records).unwrap_or_else(|error| {
+            log::warn!("Unsupported OHOS clipboard content: {error}");
+            None
+        }))
     }
 
     pub(crate) fn read(
@@ -171,36 +205,7 @@ impl OhosClipboard {
                     })
                     .await;
                 let result = result.and_then(|(records, revision)| {
-                    let mut entries = Vec::with_capacity(records.len());
-                    for record in records {
-                        if let Some(text) = record.text {
-                            entries.push(ClipboardEntry::String(ClipboardString {
-                                text,
-                                metadata: record.metadata,
-                            }));
-                        } else if let Some(bytes) = record.encoded_image {
-                            let format = image::guess_format(&bytes)
-                                .ok()
-                                .and_then(|format| {
-                                    ImageFormat::from_mime_type(format.to_mime_type())
-                                })
-                                .ok_or_else(|| {
-                                    log::warn!("Unsupported encoded OHOS clipboard image format");
-                                    ClipboardReadError::UnsupportedContent
-                                })?;
-                            entries.push(ClipboardEntry::Image(Image::from_bytes(format, bytes)));
-                        } else if let Some(uri) = record.uri {
-                            let path =
-                                ohos_fileuri_binding::get_path_from_uri(&uri).map_err(|error| {
-                                    log::warn!("Unsupported OHOS clipboard URI {uri}: {error}");
-                                    ClipboardReadError::UnsupportedContent
-                                })?;
-                            entries.push(ClipboardEntry::ExternalPaths(ExternalPaths(
-                                smallvec::smallvec![PathBuf::from(path)],
-                            )));
-                        }
-                    }
-                    let item = (!entries.is_empty()).then_some(ClipboardItem { entries });
+                    let item = item_from_records(records)?;
                     if clipboard.operation.get() == operation {
                         *clipboard.cache.borrow_mut() =
                             revision.map(|revision| (revision, item.clone()));
@@ -328,6 +333,41 @@ impl OhosClipboard {
         self.foreground_executor
             .spawn(async move { receiver.await.map_err(anyhow::Error::from)? })
     }
+}
+
+/// One item from the records a read returned, or `None` when the board holds
+/// nothing this clipboard can paste. Shared by the background read and by the
+/// synchronous read a paste gesture makes.
+fn item_from_records(
+    records: Vec<ClipboardRecord>,
+) -> std::result::Result<Option<ClipboardItem>, ClipboardReadError> {
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        if let Some(text) = record.text {
+            entries.push(ClipboardEntry::String(ClipboardString {
+                text,
+                metadata: record.metadata,
+            }));
+        } else if let Some(bytes) = record.encoded_image {
+            let format = image::guess_format(&bytes)
+                .ok()
+                .and_then(|format| ImageFormat::from_mime_type(format.to_mime_type()))
+                .ok_or_else(|| {
+                    log::warn!("Unsupported encoded OHOS clipboard image format");
+                    ClipboardReadError::UnsupportedContent
+                })?;
+            entries.push(ClipboardEntry::Image(Image::from_bytes(format, bytes)));
+        } else if let Some(uri) = record.uri {
+            let path = ohos_fileuri_binding::get_path_from_uri(&uri).map_err(|error| {
+                log::warn!("Unsupported OHOS clipboard URI {uri}: {error}");
+                ClipboardReadError::UnsupportedContent
+            })?;
+            entries.push(ClipboardEntry::ExternalPaths(ExternalPaths(
+                smallvec::smallvec![PathBuf::from(path)],
+            )));
+        }
+    }
+    Ok((!entries.is_empty()).then_some(ClipboardItem { entries }))
 }
 
 fn query_revision(plugin: &ClipboardBridgePlugin) -> Option<u32> {
