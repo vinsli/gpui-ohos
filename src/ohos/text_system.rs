@@ -1143,6 +1143,60 @@ impl OhosTextSystemState {
     }
 
     fn font_for_cluster(&self, primary: FontId, cluster: &str) -> FontId {
+        let chosen = self.choose_font_for_cluster(primary, cluster);
+        #[cfg(feature = "font-diag")]
+        self.report_cluster_face(cluster, chosen);
+        chosen
+    }
+
+    /// Which face a CJK cluster was drawn with (`font-diag` builds only).
+    ///
+    /// TASK-1.4.24: a line mixing simplified Chinese, traditional Chinese and
+    /// Japanese changed design mid-word on HarmonyOS, because the platform
+    /// picked a face per script. Proving it needs the face the shaper chose,
+    /// not the family the caller asked for, so this prints one line per
+    /// distinct (cluster, face) pair: `U+8A9E \"語\" family=... post_script=...
+    /// index=... color=...`.
+    #[cfg(feature = "font-diag")]
+    fn report_cluster_face(&self, cluster: &str, id: FontId) {
+        use std::sync::{Mutex, OnceLock};
+
+        let Some(first) = cluster.chars().next() else {
+            return;
+        };
+        // CJK ideographs, kana, Hangul, compatibility ideographs, half/full
+        // width forms: the scripts whose face must not vary within a line.
+        if !matches!(
+            first as u32,
+            0x2E80..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA960..=0xA97F
+                | 0xAC00..=0xD7FF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF
+                | 0x20000..=0x3FFFF
+        ) {
+            return;
+        }
+        let loaded = self.loaded_font(id);
+        let db = self.font_system.db();
+        let Some(face) = db.face(loaded.font.id()) else {
+            return;
+        };
+        static SEEN: OnceLock<Mutex<std::collections::HashSet<(String, char)>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let key = (face.post_script_name.clone(), first);
+        if !seen.lock().map(|mut seen| seen.insert(key)).unwrap_or(true) {
+            return;
+        }
+        println!(
+            "cjkface: U+{:04X} {:?} family={:?} post_script={:?} face_index={} color={}",
+            first as u32,
+            first.to_string(),
+            face.families.first().map(|family| family.0.as_str()).unwrap_or("?"),
+            face.post_script_name,
+            face.index,
+            loaded.has_color_glyphs,
+        );
+    }
+
+    fn choose_font_for_cluster(&self, primary: FontId, cluster: &str) -> FontId {
         // UTS #51: the variation selector (or, without one, the codepoint's
         // default presentation) decides whether the emoji glyph or the text
         // glyph is wanted. Picking the first font that merely maps the

@@ -78,6 +78,12 @@ native-vsync = ["dep:ohos-vsync-binding"]
 audio = ["dep:openharmony-ability-plugin-audio"]
 grid = ["dep:harfrust"]
 native-input = []
+# `font-diag`: print the family, PostScript name and face index every CJK
+# cluster resolves to (`cjkface:` lines). A device cannot inject environment
+# variables, so a build-time feature is the only way to measure what a mixed
+# Chinese/Japanese/Korean line actually draws with (TASK-1.4.24). Off by
+# default: it prints per distinct cluster.
+font-diag = []
 api-19 = ["openharmony-ability/api-19"]
 api-26 = ["api-19", "openharmony-ability/api-26"]
 
