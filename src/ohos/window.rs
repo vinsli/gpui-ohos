@@ -1,5 +1,9 @@
 use log::{debug, info, warn};
 
+/// How long after an input method commit a key it left to us still counts as
+/// that commit, rather than as a character of its own.
+const IME_COMMIT_WINDOW: Duration = Duration::from_millis(300);
+
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
@@ -152,6 +156,14 @@ pub(crate) struct OhosWindow {
     /// runs on every frame and `try_update_cursor` is an IPC round trip, so an
     /// unchanged rectangle must not be re-sent.
     ime_caret_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The text the input method committed most recently. ArkUI can hand a
+    /// key to the application even when the input method has just committed
+    /// it, and inserting the same character again would type it twice.
+    ime_commit: RefCell<Option<(Instant, String)>>,
+    /// The character this window inserted because the input method declined
+    /// the key. The commit for that same key can arrive just after it, and
+    /// taking both is how a letter ends up typed twice.
+    ime_inserted: RefCell<Option<(Instant, String)>>,
     /// Mode this window last applied, so a process-wide switch is noticed once.
     ime_mode: Cell<super::ime_policy::ImeMode>,
     edit_generation: Rc<Cell<u64>>,
@@ -770,6 +782,8 @@ impl OhosWindow {
             ime_text_update_pending: Rc::new(Cell::new(false)),
             ime_caret_update_pending: Rc::new(Cell::new(false)),
             ime_caret_bounds: Rc::new(Cell::new(None)),
+            ime_commit: RefCell::new(None),
+            ime_inserted: RefCell::new(None),
             ime_mode: Cell::new(super::ime_policy::ime_mode()),
             edit_generation: Rc::new(Cell::new(0)),
             clipboard,
@@ -3543,7 +3557,17 @@ impl OhosWindow {
 
         match ime_event {
             ImeEvent::TextInputEvent(data) => {
-                handler.replace_text_in_range(None, &data.text);
+                // The same key can arrive twice: once as a character this
+                // window inserted because the input method declined it, and
+                // once as this very commit.
+                let already_inserted =
+                    self.ime_inserted.borrow().as_ref().is_some_and(|(at, inserted)| {
+                        at.elapsed() < IME_COMMIT_WINDOW && *inserted == data.text
+                    });
+                *self.ime_commit.borrow_mut() = Some((Instant::now(), data.text.clone()));
+                if !already_inserted {
+                    handler.replace_text_in_range(None, &data.text);
+                }
                 handler.unmark_text();
                 self.schedule_ime_caret_update();
             }
@@ -3796,21 +3820,25 @@ impl OhosWindow {
             if let Some(action) = edit_action {
                 consumed = self.fallback_edit_action(action);
             } else if let Some(character) = character {
-                // ArkUI sends this callback only after the IME declines the key.
-                // Numeric-keypad/space input still needs a text insertion path.
+                // ArkUI sends this callback only after the IME declines the key,
+                // so the character is the application's to insert: without this
+                // a focused field would never see it, which on this system is
+                // every digit. Applications that insert characters themselves
+                // (a terminal) consume the `KeyDown` above, so they are covered
+                // by `consumed`.
                 //
-                // Detached: nothing else carries the text, so a focused input
-                // field would never see a typed character. Applications that
-                // insert characters themselves (a terminal) consume the
-                // `KeyDown` first, and a consumed key is not inserted here, so
-                // they get their one copy.
-                //
-                // Attached: the input method commits the printable keys itself
-                // (`replace_text_in_range`), so inserting the key's own
-                // character here would type every one of them twice.
-                if super::ime_policy::ime_mode() == super::ime_policy::ImeMode::Detached {
+                // An input method may still commit a key and leave it to us as
+                // well; the commit record keeps that from typing it twice.
+                let just_committed = self.ime_commit.borrow().as_ref().is_some_and(
+                    |(at, committed)| {
+                        at.elapsed() < IME_COMMIT_WINDOW && committed.contains(&character)
+                    },
+                );
+                if !just_committed {
                     if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
                         if handler.query_accepts_text_input() {
+                            *self.ime_inserted.borrow_mut() =
+                                Some((Instant::now(), character.clone()));
                             handler.unmark_text();
                             handler.replace_text_in_range(None, &character);
                             consumed = true;
