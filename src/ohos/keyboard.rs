@@ -83,7 +83,14 @@ impl OhosKeyState {
         }
         // Ability delivers each physical transition once, including IME-consumed keys.
         // Their state still matters, but their text/edit/shortcut is owned by the IME.
-        if snapshot.is_some_and(|event| event.ime_consumed) || is_modifier(code) {
+        // One exception: a chord held with Ctrl, Alt or Super is always the app's.
+        // `ime_consumed` says the IME took this key, and while a composition is in
+        // progress it marks even `Ctrl+Shift+P` consumed; honouring that would drop
+        // shortcuts the terminal needs. Dispatch those chords anyway.
+        let app_chord = self.modifiers.control || self.modifiers.alt || self.modifiers.platform;
+        if (snapshot.is_some_and(|event| event.ime_consumed) && !app_chord)
+            || is_modifier(code)
+        {
             return output;
         }
         let Some(key) =
