@@ -61,6 +61,15 @@ type ResizeCallback = Box<dyn FnMut(Size<Pixels>, f32)>;
 type WindowList = RefCell<Vec<Weak<RefCell<OhosWindow>>>>;
 type WindowIndex = RefCell<FxHashMap<i64, Weak<RefCell<OhosWindow>>>>;
 
+/// How long after a real mouse event an emulated touch contact is still treated
+/// as that mouse's shadow rather than as a finger.
+///
+/// HarmonyOS delivers one mouse press twice: as a `Mouse` event and as an
+/// emulated touch contact. The contact exists only alongside the mouse stream, so
+/// its proximity in time identifies it, and a device that delivers no mouse
+/// stream keeps working from the contact alone.
+const MOUSE_SHADOW_WINDOW: Duration = Duration::from_secs(1);
+
 pub(crate) struct OhosWindowContext {
     pub(crate) form_factor: super::device::DeviceFormFactor,
     pub(crate) native_menus: bool,
@@ -164,6 +173,7 @@ pub(crate) struct OhosWindow {
     pointer_screen_position: Cell<Option<(i64, i64)>>,
     pressed_mouse_button: Cell<MouseButtons>,
     mouse_click: RefCell<Option<MouseClickState>>,
+    mouse_event_at: Cell<Option<Instant>>,
     native_pointer_id: Cell<Option<i32>>,
     native_drag: Rc<RefCell<Option<openharmony_ability::NativeFileDrag>>>,
     native_drag_pending: Rc<Cell<bool>>,
@@ -797,6 +807,7 @@ impl OhosWindow {
             pointer_screen_position: Cell::new(None),
             pressed_mouse_button: Cell::new(MouseButtons::default()),
             mouse_click: RefCell::new(None),
+            mouse_event_at: Cell::new(None),
             native_pointer_id: Cell::new(None),
             native_drag: Rc::new(RefCell::new(None)),
             native_drag_pending: Rc::new(Cell::new(false)),
@@ -1258,8 +1269,26 @@ impl OhosWindow {
         targets_text_input
     }
 
+    /// Whether `point` stands for the mouse rather than for a finger.
+    ///
+    /// A finger reports `TouchPointTool::Finger`; the contact HarmonyOS emulates
+    /// for a mouse press reports `Mouse`, or `Unknown` on HarmonyOS 5/6. Keeping
+    /// the emulated contact makes the touch recognizer synthesize a second
+    /// MouseDown, which turns one physical click into two presses and selects a
+    /// word instead of placing the cursor.
+    fn is_mouse_contact(&self, point: &TouchPointData) -> bool {
+        match point.event_tool_type {
+            TouchPointTool::Mouse => true,
+            TouchPointTool::Unknown => self
+                .mouse_event_at
+                .get()
+                .is_some_and(|at| at.elapsed() <= MOUSE_SHADOW_WINDOW),
+            _ => false,
+        }
+    }
+
     fn dispatch_raw_touch_data(&self, event: &TouchEventData, point: &TouchPointData) {
-        if point.event_tool_type == TouchPointTool::Mouse {
+        if self.is_mouse_contact(point) {
             return;
         }
         let phase = match event.event_type {
@@ -1281,10 +1310,7 @@ impl OhosWindow {
 
     fn dispatch_raw_touch_event(&self, event: &TouchEventData) {
         if !event.touch_points.is_empty()
-            && event
-                .touch_points
-                .iter()
-                .all(|point| point.event_tool_type == TouchPointTool::Mouse)
+            && event.touch_points.iter().all(|point| self.is_mouse_contact(point))
         {
             return;
         }
@@ -3184,6 +3210,7 @@ impl OhosWindow {
                 self.schedule_ime_text_update();
             }
             InputEvent::XComponent(XComponentInputEvent::Mouse(mouse_event)) => {
+                self.mouse_event_at.set(Some(Instant::now()));
                 if mouse_event.action == MouseAction::Press
                     && mouse_event.screen_x.is_finite()
                     && mouse_event.screen_y.is_finite()
