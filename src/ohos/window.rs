@@ -55,6 +55,14 @@ use crate::{
     WindowDecorations, WindowInsets, WindowParams, WindowVisibility, accesskit, point, px, size,
 };
 
+/// How long the pointer stack must keep reporting a released button, while we
+/// still hold one, before the press counts as lost.
+///
+/// A wheel burst reports `Some(false)` for a handful of pointer moves — about
+/// 10 ms — even though the physical button is still down, so a single report must
+/// not end a drag. A release this window never saw keeps reporting it.
+const BUTTON_LOSS_CONFIRM: Duration = Duration::from_millis(40);
+
 pub(crate) type BackHandler = Rc<RefCell<Option<Box<dyn FnMut()>>>>;
 type ResizeCallback = Box<dyn FnMut(Size<Pixels>, f32)>;
 
@@ -174,6 +182,7 @@ pub(crate) struct OhosWindow {
     pressed_mouse_button: Cell<MouseButtons>,
     mouse_click: RefCell<Option<MouseClickState>>,
     mouse_event_at: Cell<Option<Instant>>,
+    button_loss_at: Cell<Option<Instant>>,
     native_pointer_id: Cell<Option<i32>>,
     native_drag: Rc<RefCell<Option<openharmony_ability::NativeFileDrag>>>,
     native_drag_pending: Rc<Cell<bool>>,
@@ -808,6 +817,7 @@ impl OhosWindow {
             pressed_mouse_button: Cell::new(MouseButtons::default()),
             mouse_click: RefCell::new(None),
             mouse_event_at: Cell::new(None),
+            button_loss_at: Cell::new(None),
             native_pointer_id: Cell::new(None),
             native_drag: Rc::new(RefCell::new(None)),
             native_drag_pending: Rc::new(Cell::new(false)),
@@ -2004,7 +2014,26 @@ impl OhosWindow {
         self.callbacks.borrow_mut().hover_status_change = callback;
     }
 
+    /// End a press the pointer stack has stopped reporting as held.
+    ///
+    /// Only a release that persists is believed: a wheel burst and the re-entry
+    /// moves after a hover gap both report `Some(false)` for a few milliseconds
+    /// before the next report says the button is still down, and ending the press
+    /// on the first such report cancels a live drag-select.
+    fn confirm_button_loss(&self) {
+        let now = Instant::now();
+        match self.button_loss_at.get() {
+            Some(first) if now.duration_since(first) >= BUTTON_LOSS_CONFIRM => {
+                self.button_loss_at.set(None);
+                self.cancel_mouse_input();
+            }
+            Some(_) => {}
+            None => self.button_loss_at.set(Some(now)),
+        }
+    }
+
     fn cancel_mouse_input(&self) {
+        self.button_loss_at.set(None);
         if self.primary_touch.get().is_none() {
             self.manipulation.set(None);
             if let Some(subscription) = self.move_subscription.borrow().as_ref() {
@@ -3257,6 +3286,7 @@ impl OhosWindow {
                         let mut held = self.pressed_mouse_button.get();
                         held.press(button);
                         self.pressed_mouse_button.set(held);
+                        self.button_loss_at.set(None);
                         let result =
                             self.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                                 button,
@@ -3351,9 +3381,10 @@ impl OhosWindow {
                     // window. Reconcile buttons before using re-entry coordinates.
                     if pointer.mouse_buttons_pressed == Some(false) {
                         if self.pressed_mouse_button.get().first().is_some() {
-                            self.cancel_mouse_input();
+                            self.confirm_button_loss();
                         }
                     } else {
+                        self.button_loss_at.set(None);
                         self.record_screen_pointer(pointer.display_x, pointer.display_y);
                     }
                 }
