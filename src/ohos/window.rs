@@ -3741,12 +3741,16 @@ impl OhosWindow {
                 // ArkUI sends this callback only after the IME declines the key.
                 // Numeric-keypad/space input still needs a text insertion path.
                 //
-                // With the IME detached there is nothing to insert *for*: the
-                // keystroke already reached the application as `KeyDown`, and an
-                // application that inserts characters itself (a terminal) would
-                // add every printable key twice. Insertion from a keystroke is a
-                // compensation for a bound IME that owned the text path.
-                if super::ime_policy::ime_mode() == super::ime_policy::ImeMode::Attached {
+                // Detached: nothing else carries the text, so a focused input
+                // field would never see a typed character. Applications that
+                // insert characters themselves (a terminal) consume the
+                // `KeyDown` first, and a consumed key is not inserted here, so
+                // they get their one copy.
+                //
+                // Attached: the input method commits the printable keys itself
+                // (`replace_text_in_range`), so inserting the key's own
+                // character here would type every one of them twice.
+                if super::ime_policy::ime_mode() == super::ime_policy::ImeMode::Detached {
                     if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
                         if handler.query_accepts_text_input() {
                             handler.unmark_text();
